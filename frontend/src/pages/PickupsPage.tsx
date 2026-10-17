@@ -1,0 +1,1372 @@
+import { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Layout } from '../components/Layout';
+import {
+  Calendar, Plus, Search, Filter, MapPin, Clock, Trash2,
+  CheckCircle, AlertCircle, XCircle, Package, X, ChevronRight, Navigation, Map, Loader2, UserCheck
+} from 'lucide-react';
+import { pickupService } from '../services/pickup.service';
+import { userService } from '../services/user.service';
+import { binService } from '../services/bin.service';
+import { useAuth } from '../contexts/AuthContext';
+import { MapContainer, TileLayer, Marker, useMapEvents, Popup } from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+
+// Fix Leaflet default marker icon issue
+delete (L.Icon.Default.prototype as any)._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+});
+
+// Component to handle map clicks
+function LocationMarker({ position, setPosition }: { position: { lat: number; lng: number } | null; setPosition: (pos: { lat: number; lng: number }) => void }) {
+  useMapEvents({
+    click(e) {
+      setPosition({
+        lat: e.latlng.lat,
+        lng: e.latlng.lng,
+      });
+    },
+  });
+
+  return position === null ? null : (
+    <Marker position={[position.lat, position.lng]} />
+  );
+}
+
+interface PickupRequest {
+  id: string;
+  address: string;
+  wasteType: 'bulk' | 'hazardous' | 'electronic' | 'construction' | 'organic' | 'recyclable' | 'other';
+  requestDate: string;
+  preferredDate: string;
+  preferredTime: 'morning' | 'afternoon' | 'evening';
+  status: 'pending' | 'scheduled' | 'completed' | 'cancelled';
+  collectorName?: string;
+  notes?: string;
+  weight?: number;
+  scheduledDate?: string;
+}
+
+export const PickupsPage = () => {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [filterType, setFilterType] = useState<string>('all');
+  const [showRequestModal, setShowRequestModal] = useState(false);
+  const [showDetailsModal, setShowDetailsModal] = useState(false);
+  const [showAssignModal, setShowAssignModal] = useState(false);
+  const [selectedPickup, setSelectedPickup] = useState<PickupRequest | null>(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const [showMapPicker, setShowMapPicker] = useState(false);
+  const [showBinSelector, setShowBinSelector] = useState(false);
+  const [tempMapLocation, setTempMapLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [pickupCoordinates, setPickupCoordinates] = useState<{ lat: number; lng: number } | null>(null);
+  const [gettingLocation, setGettingLocation] = useState(false);
+  const [selectedCollectorId, setSelectedCollectorId] = useState('');
+  const [scheduledDate, setScheduledDate] = useState('');
+
+  const queryClient = useQueryClient();
+  const { user } = useAuth();
+
+  // Fetch pickup requests with filters
+  const { data: pickupsData, isLoading, error } = useQuery({
+    queryKey: ['pickups', { search: searchTerm, status: filterStatus, wasteType: filterType }],
+    queryFn: () => pickupService.getAllPickups({
+      search: searchTerm,
+      status: filterStatus !== 'all' ? filterStatus : undefined,
+      wasteType: filterType !== 'all' ? filterType : undefined,
+    }),
+  });
+
+  // Fetch user's bins (for residents only)
+  const { data: userBinsData } = useQuery({
+    queryKey: ['userBins'],
+    queryFn: () => binService.getAllBins({ assignedTo: user?._id }),
+    enabled: user?.role === 'resident' && showBinSelector,
+  });
+
+  // Create pickup mutation
+  const createPickupMutation = useMutation({
+    mutationFn: pickupService.createPickup,
+    onSuccess: (response) => {
+      queryClient.invalidateQueries({ queryKey: ['pickups'] });
+      setShowRequestModal(false);
+      resetNewRequest();
+      // Show success message
+      alert(response?.message || 'Pickup request submitted successfully.');
+    },
+    onError: (error: any) => {
+      const errorMessage = error.response?.data?.message || error.message;
+      
+      // Check if it's a schedule conflict error
+      if (errorMessage.includes('already scheduled')) {
+        alert(`⚠️ ${errorMessage}\n\nPlease choose a different date or cancel the existing pickup first.`);
+      } else {
+        alert(`Error creating pickup: ${errorMessage}`);
+      }
+      
+      console.error('Pickup creation error:', error.response?.data);
+    },
+  });
+
+  // Update pickup mutation
+  const updatePickupMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: any }) => pickupService.updatePickup(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['pickups'] });
+      setShowDetailsModal(false);
+    },
+  });
+
+  // Cancel pickup mutation
+  const cancelPickupMutation = useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) => pickupService.cancelPickup(id, reason),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['pickups'] });
+    },
+    onError: (error: any) => {
+      alert(`Error cancelling pickup: ${error.response?.data?.message || error.message}`);
+    },
+  });
+
+  // Fetch collectors for assignment
+  const { data: collectorsData } = useQuery({
+    queryKey: ['collectors'],
+    queryFn: () => userService.getAllUsers({ role: 'collector' }),
+    enabled: user?.role === 'operator' || user?.role === 'admin',
+  });
+
+  // Assign collector mutation
+  const assignCollectorMutation = useMutation({
+    mutationFn: ({ id, collectorId, scheduledDate }: { id: string; collectorId: string; scheduledDate: string }) =>
+      pickupService.assignCollector(id, collectorId, scheduledDate),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['pickups'] });
+      setShowAssignModal(false);
+      setSelectedCollectorId('');
+      setScheduledDate('');
+      alert('Collector assigned successfully!');
+    },
+    onError: (error: any) => {
+      alert(`Error assigning collector: ${error.response?.data?.message || error.message}`);
+    },
+  });
+
+  const collectors = collectorsData?.data || [];
+
+  const pickupRequests: PickupRequest[] = pickupsData?.data?.map((pickup: any) => ({
+    id: pickup._id,
+    address: pickup.pickupLocation?.address || pickup.location?.address || 'Unknown Address',
+    wasteType: pickup.wasteType,
+    requestDate: pickup.createdAt ? new Date(pickup.createdAt).toISOString().split('T')[0] : new Date().toISOString().split('T')[0],
+    preferredDate: new Date(pickup.preferredDate).toISOString().split('T')[0],
+    preferredTime: pickup.timeSlot || 'morning',
+    status: pickup.status,
+    collectorName: pickup.assignedCollector?.firstName ? `${pickup.assignedCollector.firstName} ${pickup.assignedCollector.lastName}` : undefined,
+    scheduledDate: pickup.scheduledDate ? new Date(pickup.scheduledDate).toISOString().split('T')[0] : undefined,
+    notes: pickup.notes || pickup.description,
+    weight: pickup.quantity?.value,
+  })) || [];
+
+  const [newRequest, setNewRequest] = useState<Partial<PickupRequest>>({
+    address: '123 Main St, Apt 4B',
+    wasteType: 'recyclable',
+    preferredDate: '',
+    preferredTime: 'morning',
+    status: 'pending',
+    requestDate: new Date().toISOString().split('T')[0],
+    notes: ''
+  });
+
+  // Pickups are already filtered by the API query
+  const filteredPickups = pickupRequests;
+
+  // Statistics
+  const stats = {
+    total: pickupRequests.length,
+    pending: pickupRequests.filter(p => p.status === 'pending').length,
+    scheduled: pickupRequests.filter(p => p.status === 'scheduled').length,
+    completed: pickupRequests.filter(p => p.status === 'completed').length,
+    cancelled: pickupRequests.filter(p => p.status === 'cancelled').length
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'pending': return 'text-yellow-600 bg-yellow-50 border-yellow-200';
+      case 'scheduled': return 'text-blue-600 bg-blue-50 border-blue-200';
+      case 'completed': return 'text-emerald-600 bg-emerald-50 border-emerald-200';
+      case 'cancelled': return 'text-red-600 bg-red-50 border-red-200';
+      default: return 'text-gray-600 bg-gray-50 border-gray-200';
+    }
+  };
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'pending': return <Clock className="w-4 h-4" />;
+      case 'scheduled': return <Calendar className="w-4 h-4" />;
+      case 'completed': return <CheckCircle className="w-4 h-4" />;
+      case 'cancelled': return <XCircle className="w-4 h-4" />;
+      default: return <Clock className="w-4 h-4" />;
+    }
+  };
+
+  const getWasteTypeColor = (type: string) => {
+    switch (type) {
+      case 'bulk': return 'bg-purple-100 text-purple-700';
+      case 'hazardous': return 'bg-red-100 text-red-700';
+      case 'electronic': return 'bg-yellow-100 text-yellow-700';
+      case 'construction': return 'bg-orange-100 text-orange-700';
+      case 'organic': return 'bg-green-100 text-green-700';
+      case 'recyclable': return 'bg-blue-100 text-blue-700';
+      case 'other': return 'bg-gray-100 text-gray-700';
+      default: return 'bg-gray-100 text-gray-700';
+    }
+  };
+
+  const getWasteTypeIcon = () => {
+    return <Trash2 className="w-4 h-4" />;
+  };
+
+  const handleRequestPickup = () => {
+    // Validate that location has been captured
+    if (!pickupCoordinates) {
+      alert('Please select your pickup location using GPS or Map before submitting the request.');
+      return;
+    }
+
+    createPickupMutation.mutate({
+      wasteType: newRequest.wasteType,
+      description: newRequest.notes || 'Pickup request',
+      quantity: {
+        value: 1,
+        unit: 'items'
+      },
+      pickupLocation: {
+        type: 'Point',
+        coordinates: [pickupCoordinates.lng, pickupCoordinates.lat], // [longitude, latitude] for GeoJSON
+        address: newRequest.address || 'Pickup location'
+      },
+      preferredDate: newRequest.preferredDate,
+      timeSlot: newRequest.preferredTime,
+      contactPerson: {
+        name: 'User', // Will be populated from logged-in user
+        phone: '0771234567'
+      },
+      notes: newRequest.notes,
+    });
+  };
+
+  const handleCancelPickup = (id: string) => {
+    if (confirm('Are you sure you want to cancel this pickup request?')) {
+      cancelPickupMutation.mutate({ id, reason: 'Cancelled by user' });
+    }
+  };
+
+  const handleAssignCollector = () => {
+    if (!selectedCollectorId) {
+      alert('Please select a collector');
+      return;
+    }
+    if (!scheduledDate) {
+      alert('Please select a scheduled date');
+      return;
+    }
+    if (!selectedPickup) return;
+
+    assignCollectorMutation.mutate({
+      id: selectedPickup.id,
+      collectorId: selectedCollectorId,
+      scheduledDate: scheduledDate,
+    });
+  };
+
+  const getCurrentLocation = () => {
+    if (!navigator.geolocation) {
+      alert('Geolocation is not supported by your browser');
+      return;
+    }
+
+    setGettingLocation(true);
+
+    navigator.geolocation.getCurrentPosition(
+      async (position) => {
+        const { latitude, longitude } = position.coords;
+        setPickupCoordinates({ lat: latitude, lng: longitude });
+
+        // Reverse geocode to get address
+        try {
+          const response = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}`
+          );
+          const data = await response.json();
+          
+          if (data.display_name) {
+            setNewRequest({ ...newRequest, address: data.display_name });
+          }
+        } catch (error) {
+          console.error('Error getting address:', error);
+          setNewRequest({ 
+            ...newRequest, 
+            address: `Location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}` 
+          });
+        }
+
+        setGettingLocation(false);
+      },
+      (error) => {
+        console.error('Error getting location:', error);
+        alert('Unable to get your location. Please ensure location permissions are enabled.');
+        setGettingLocation(false);
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0
+      }
+    );
+  };
+
+  const handleMapLocationSelect = async () => {
+    if (tempMapLocation) {
+      setPickupCoordinates(tempMapLocation);
+
+      // Reverse geocode to get address
+      try {
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?format=json&lat=${tempMapLocation.lat}&lon=${tempMapLocation.lng}`
+        );
+        const data = await response.json();
+        
+        if (data.display_name) {
+          setNewRequest({ ...newRequest, address: data.display_name });
+        }
+      } catch (error) {
+        console.error('Error getting address:', error);
+        setNewRequest({ 
+          ...newRequest, 
+          address: `Location: ${tempMapLocation.lat.toFixed(6)}, ${tempMapLocation.lng.toFixed(6)}` 
+        });
+      }
+
+      setShowMapPicker(false);
+      setTempMapLocation(null);
+    }
+  };
+
+  const handleBinSelect = async (bin: any) => {
+    // Set coordinates from bin location
+    const lat = bin.location.coordinates[1];
+    const lng = bin.location.coordinates[0];
+    setPickupCoordinates({ lat, lng });
+
+    // Use bin's address or reverse geocode
+    if (bin.location.address) {
+      setNewRequest({ ...newRequest, address: bin.location.address });
+    } else {
+      try {
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`
+        );
+        const data = await response.json();
+        if (data.display_name) {
+          setNewRequest({ ...newRequest, address: data.display_name });
+        }
+      } catch (error) {
+        console.error('Error getting address:', error);
+        setNewRequest({ 
+          ...newRequest, 
+          address: `Bin Location: ${lat.toFixed(6)}, ${lng.toFixed(6)}` 
+        });
+      }
+    }
+
+    setShowBinSelector(false);
+  };
+
+  const resetNewRequest = () => {
+    setNewRequest({
+      address: '',
+      wasteType: 'recyclable',
+      preferredDate: '',
+      preferredTime: 'morning',
+      status: 'pending',
+      requestDate: new Date().toISOString().split('T')[0],
+      notes: ''
+    });
+    setPickupCoordinates(null);
+    setTempMapLocation(null);
+    setGettingLocation(false);
+  };
+
+  return (
+    <Layout>
+      <div className="p-6 max-w-7xl mx-auto space-y-6">
+        {/* Header */}
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-3">
+              <div className="p-2 bg-gradient-to-br from-emerald-500 to-teal-600 rounded-xl text-white">
+                <Calendar className="w-7 h-7" />
+              </div>
+              Pickup Requests
+            </h1>
+            <p className="text-gray-600 mt-1">Request and track your waste collection pickups</p>
+          </div>
+          <button
+            onClick={() => setShowRequestModal(true)}
+            className="px-6 py-3 bg-gradient-to-r from-emerald-500 to-teal-600 text-white rounded-xl hover:from-emerald-600 hover:to-teal-700 transition-all duration-200 flex items-center gap-2 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
+          >
+            <Plus className="w-5 h-5" />
+            Request Pickup
+          </button>
+        </div>
+
+        {/* Loading State */}
+        {isLoading && (
+          <div className="flex items-center justify-center py-12">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-600"></div>
+          </div>
+        )}
+
+        {/* Error State */}
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
+            <p className="font-medium">Error loading pickup requests</p>
+            <p className="text-sm mt-1">{error instanceof Error ? error.message : 'An error occurred'}</p>
+          </div>
+        )}
+
+        {/* Statistics Cards */}
+        {!isLoading && !error && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div className="bg-white rounded-xl p-5 border border-gray-200 hover:shadow-lg transition-shadow">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-gray-600">Total</p>
+                <p className="text-2xl font-bold text-gray-900 mt-1">{stats.total}</p>
+              </div>
+              <div className="p-3 bg-gray-100 rounded-lg">
+                <Calendar className="w-6 h-6 text-gray-600" />
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl p-5 border border-gray-200 hover:shadow-lg transition-shadow">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-gray-600">Pending</p>
+                <p className="text-2xl font-bold text-yellow-600 mt-1">{stats.pending}</p>
+              </div>
+              <div className="p-3 bg-yellow-100 rounded-lg">
+                <Clock className="w-6 h-6 text-yellow-600" />
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl p-5 border border-gray-200 hover:shadow-lg transition-shadow">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-gray-600">Scheduled</p>
+                <p className="text-2xl font-bold text-blue-600 mt-1">{stats.scheduled}</p>
+              </div>
+              <div className="p-3 bg-blue-100 rounded-lg">
+                <Calendar className="w-6 h-6 text-blue-600" />
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl p-5 border border-gray-200 hover:shadow-lg transition-shadow">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-gray-600">Completed</p>
+                <p className="text-2xl font-bold text-emerald-600 mt-1">{stats.completed}</p>
+              </div>
+              <div className="p-3 bg-emerald-100 rounded-lg">
+                <CheckCircle className="w-6 h-6 text-emerald-600" />
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl p-5 border border-gray-200 hover:shadow-lg transition-shadow">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-gray-600">Cancelled</p>
+                <p className="text-2xl font-bold text-red-600 mt-1">{stats.cancelled}</p>
+              </div>
+              <div className="p-3 bg-red-100 rounded-lg">
+                <XCircle className="w-6 h-6 text-red-600" />
+              </div>
+            </div>
+          </div>
+        </div>
+        )}
+
+        {/* Search and Filters */}
+        {!isLoading && !error && (
+        <div className="bg-white rounded-xl p-5 border border-gray-200 shadow-sm">
+          <div className="flex flex-col lg:flex-row gap-4">
+            {/* Search */}
+            <div className="flex-1 relative">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+              <input
+                type="text"
+                placeholder="Search by address or waste type..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full pl-10 pr-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+              />
+            </div>
+
+            {/* Filter Button */}
+            <button
+              onClick={() => setShowFilters(!showFilters)}
+              className={`px-4 py-2.5 rounded-lg border transition-colors flex items-center gap-2 ${
+                showFilters ? 'bg-emerald-50 border-emerald-300 text-emerald-700' : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              <Filter className="w-5 h-5" />
+              Filters
+            </button>
+          </div>
+
+          {/* Expandable Filters */}
+          {showFilters && (
+            <div className="mt-4 pt-4 border-t border-gray-200 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Status</label>
+                <select
+                  value={filterStatus}
+                  onChange={(e) => setFilterStatus(e.target.value)}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                >
+                  <option value="all">All Status</option>
+                  <option value="pending">Pending</option>
+                  <option value="scheduled">Scheduled</option>
+                  <option value="completed">Completed</option>
+                  <option value="cancelled">Cancelled</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Waste Type</label>
+                <select
+                  value={filterType}
+                  onChange={(e) => setFilterType(e.target.value)}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                >
+                  <option value="all">All Types</option>
+                  <option value="bulk">Bulk Items</option>
+                  <option value="hazardous">Hazardous Waste</option>
+                  <option value="electronic">Electronic Waste</option>
+                  <option value="construction">Construction Waste</option>
+                  <option value="organic">Organic Waste</option>
+                  <option value="recyclable">Recyclable</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+            </div>
+          )}
+        </div>
+        )}
+
+        {/* Pickup Requests List */}
+        {!isLoading && !error && (
+        <div className="space-y-4">
+          {filteredPickups.map((pickup) => (
+            <div
+              key={pickup.id}
+              className="bg-white rounded-xl border border-gray-200 hover:shadow-lg transition-all duration-300 overflow-hidden"
+            >
+              <div className="p-6">
+                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                  {/* Left Section */}
+                  <div className="flex-1 space-y-3">
+                    <div className="flex items-start gap-3">
+                      <div className="p-2 bg-emerald-100 rounded-lg">
+                        {getWasteTypeIcon()}
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getWasteTypeColor(pickup.wasteType)}`}>
+                            {pickup.wasteType}
+                          </span>
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium border flex items-center gap-1 ${getStatusColor(pickup.status)}`}>
+                            {getStatusIcon(pickup.status)}
+                            {pickup.status}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 text-gray-600 mt-2">
+                          <MapPin className="w-4 h-4" />
+                          <span className="text-sm">{pickup.address}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Details Grid */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-3 border-t border-gray-100">
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Requested</p>
+                        <p className="text-sm font-medium text-gray-900">{pickup.requestDate}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Preferred Date</p>
+                        <p className="text-sm font-medium text-gray-900">{pickup.preferredDate}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Time Slot</p>
+                        <p className="text-sm font-medium text-gray-900 capitalize">{pickup.preferredTime}</p>
+                      </div>
+                      {pickup.collectorName && (
+                        <div>
+                          <p className="text-xs text-gray-500 mb-1">Collector</p>
+                          <p className="text-sm font-medium text-gray-900">{pickup.collectorName}</p>
+                        </div>
+                      )}
+                    </div>
+
+                    {pickup.notes && (
+                      <div className="pt-3 border-t border-gray-100">
+                        <p className="text-xs text-gray-500 mb-1">Notes</p>
+                        <p className="text-sm text-gray-700">{pickup.notes}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right Section - Actions */}
+                  <div className="flex flex-row lg:flex-col gap-2">
+                    <button
+                      onClick={() => {
+                        setSelectedPickup(pickup);
+                        setShowDetailsModal(true);
+                      }}
+                      className="flex-1 lg:flex-none px-4 py-2 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors text-sm font-medium flex items-center justify-center gap-2"
+                    >
+                      View Details
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                    
+                    {/* Assign Collector Button - Only for Operators/Admins on Pending Pickups */}
+                    {(user?.role === 'operator' || user?.role === 'admin') && pickup.status === 'pending' && (
+                      <button
+                        onClick={() => {
+                          setSelectedPickup(pickup);
+                          setScheduledDate(pickup.preferredDate); // Pre-fill with preferred date
+                          setShowAssignModal(true);
+                        }}
+                        className="flex-1 lg:flex-none px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors text-sm font-medium flex items-center justify-center gap-2"
+                      >
+                        <UserCheck className="w-4 h-4" />
+                        Assign Collector
+                      </button>
+                    )}
+                    
+                    {(pickup.status === 'pending' || pickup.status === 'scheduled') && (
+                      <button
+                        onClick={() => handleCancelPickup(pickup.id)}
+                        className="flex-1 lg:flex-none px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors text-sm font-medium"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+
+        {/* No Results */}
+        {filteredPickups.length === 0 && (
+          <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
+            <Calendar className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">No pickup requests found</h3>
+            <p className="text-gray-600 mb-4">Try adjusting your search or filters</p>
+            <button
+              onClick={() => setShowRequestModal(true)}
+              className="px-6 py-3 bg-gradient-to-r from-emerald-500 to-teal-600 text-white rounded-xl hover:from-emerald-600 hover:to-teal-700 transition-all inline-flex items-center gap-2"
+            >
+              <Plus className="w-5 h-5" />
+              Request Your First Pickup
+            </button>
+          </div>
+        )}
+        </div>
+        )}
+      </div>
+
+      {/* Request Pickup Modal */}
+      {showRequestModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full my-8 transform transition-all animate-fadeIn">
+            <div className="sticky top-0 bg-gradient-to-r from-emerald-500 to-teal-600 px-8 py-6 rounded-t-3xl z-10">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="p-3 bg-white/20 backdrop-blur-sm rounded-2xl">
+                    <Package className="w-8 h-8 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">Request Pickup</h2>
+                    <p className="text-emerald-50 text-sm mt-1">Schedule a waste collection pickup</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setShowRequestModal(false);
+                    resetNewRequest();
+                  }}
+                  className="p-2 hover:bg-white/20 rounded-xl transition-all"
+                >
+                  <X className="w-6 h-6 text-white" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-8 space-y-6 max-h-[calc(90vh-200px)] overflow-y-auto">
+              <div>
+                <label className="block text-sm font-bold text-gray-700 mb-2">Pickup Address *</label>
+                <div className="flex gap-3 mb-2">
+                  <input
+                    type="text"
+                    value={newRequest.address}
+                    onChange={(e) => setNewRequest({ ...newRequest, address: e.target.value })}
+                    className="flex-1 px-4 py-3 border-2 border-gray-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
+                    placeholder="Full address including district"
+                  />
+                  {user?.role === 'resident' && (
+                    <button
+                      type="button"
+                      onClick={() => setShowBinSelector(true)}
+                      className="px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-600 text-white rounded-xl hover:from-emerald-600 hover:to-teal-700 transition-all flex items-center gap-2 whitespace-nowrap shadow-md hover:shadow-lg font-semibold"
+                      title="Select from my bins"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                      My Bins
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={getCurrentLocation}
+                    disabled={gettingLocation}
+                    className="px-5 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl hover:from-blue-600 hover:to-indigo-700 transition-all flex items-center gap-2 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed shadow-md hover:shadow-lg font-semibold"
+                    title="Use my current location"
+                  >
+                    {gettingLocation ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        GPS
+                      </>
+                    ) : (
+                      <>
+                        <Navigation className="w-5 h-5" />
+                        GPS
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowMapPicker(true)}
+                    className="px-5 py-3 bg-gradient-to-r from-purple-500 to-pink-600 text-white rounded-xl hover:from-purple-600 hover:to-pink-700 transition-all flex items-center gap-2 whitespace-nowrap shadow-md hover:shadow-lg font-semibold"
+                    title="Select location on map"
+                  >
+                    <Map className="w-5 h-5" />
+                    Map
+                  </button>
+                </div>
+                {pickupCoordinates && (
+                  <p className="text-sm text-emerald-600 flex items-center gap-2 bg-emerald-50 px-3 py-2 rounded-lg">
+                    <CheckCircle className="w-4 h-4" />
+                    Location captured: {pickupCoordinates.lat.toFixed(6)}, {pickupCoordinates.lng.toFixed(6)}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-bold text-gray-700 mb-2">Waste Type *</label>
+                <select
+                  value={newRequest.wasteType}
+                  onChange={(e) => setNewRequest({ ...newRequest, wasteType: e.target.value as PickupRequest['wasteType'] })}
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
+                >
+                  <option value="recyclable">Recyclable</option>
+                  <option value="bulk">Bulk Items</option>
+                  <option value="hazardous">Hazardous Waste</option>
+                  <option value="electronic">Electronic Waste</option>
+                  <option value="construction">Construction Waste</option>
+                  <option value="organic">Organic Waste</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                <div>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">Preferred Date *</label>
+                  <input
+                    type="date"
+                    value={newRequest.preferredDate}
+                    onChange={(e) => setNewRequest({ ...newRequest, preferredDate: e.target.value })}
+                    min={new Date().toISOString().split('T')[0]}
+                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">Preferred Time *</label>
+                  <select
+                    value={newRequest.preferredTime}
+                    onChange={(e) => setNewRequest({ ...newRequest, preferredTime: e.target.value as PickupRequest['preferredTime'] })}
+                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
+                  >
+                    <option value="morning">Morning (8 AM - 12 PM)</option>
+                    <option value="afternoon">Afternoon (12 PM - 4 PM)</option>
+                    <option value="evening">Evening (4 PM - 8 PM)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-bold text-gray-700 mb-2">Additional Notes</label>
+                <textarea
+                  value={newRequest.notes}
+                  onChange={(e) => setNewRequest({ ...newRequest, notes: e.target.value })}
+                  rows={4}
+                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-all"
+                  placeholder="Any special instructions or details..."
+                />
+              </div>
+
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                <div className="flex gap-3">
+                  <AlertCircle className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+                  <div className="text-sm text-blue-800">
+                    <p className="font-semibold mb-1">Important Information:</p>
+                    <ul className="list-disc list-inside space-y-1 text-blue-700">
+                      <li>Pickup requests are processed within 24 hours</li>
+                      <li>You will receive a confirmation once scheduled</li>
+                      <li>Please ensure waste is properly sorted and sealed</li>
+                      <li>Hazardous waste requires special handling</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="sticky bottom-0 bg-gray-50 px-8 py-5 rounded-b-3xl border-t border-gray-200">
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    setShowRequestModal(false);
+                    resetNewRequest();
+                  }}
+                  className="flex-1 px-8 py-3.5 bg-gradient-to-r from-gray-600 to-gray-700 text-white rounded-xl hover:from-gray-700 hover:to-gray-800 transition-all duration-200 font-semibold shadow-md hover:shadow-lg transform hover:scale-[1.02]"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleRequestPickup}
+                  disabled={!newRequest.address || !newRequest.preferredDate}
+                  className="flex-1 px-8 py-3.5 bg-gradient-to-r from-emerald-500 to-teal-600 text-white rounded-xl hover:from-emerald-600 hover:to-teal-700 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed font-semibold shadow-md hover:shadow-lg transform hover:scale-[1.02]"
+                >
+                  Submit Request
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Map Location Picker Modal */}
+      {showMapPicker && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-5xl w-full h-[80vh] flex flex-col transform transition-all animate-fadeIn">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-purple-500 to-pink-600 px-8 py-6 rounded-t-3xl">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="p-3 bg-white/20 backdrop-blur-sm rounded-2xl">
+                    <Map className="w-8 h-8 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">Select Pickup Location</h2>
+                    <p className="text-purple-50 text-sm mt-1">Click anywhere on the map to set pickup location</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setShowMapPicker(false);
+                    setTempMapLocation(null);
+                  }}
+                  className="p-2 hover:bg-white/20 rounded-xl transition-all"
+                >
+                  <X className="w-6 h-6 text-white" />
+                </button>
+              </div>
+            </div>
+
+            {/* Map Container */}
+            <div className="flex-1 relative">
+              <MapContainer
+                center={[7.8731, 80.7718]} // Center of Sri Lanka
+                zoom={7.5}
+                minZoom={7}
+                maxZoom={18}
+                maxBounds={[
+                  [5.5, 79.0],  // Southwest - extended to show only ocean
+                  [10.2, 82.5]  // Northeast - extended to show only ocean
+                ]}
+                maxBoundsViscosity={1.0}
+                style={{ height: '100%', width: '100%' }}
+                className="rounded-b-3xl"
+              >
+                <TileLayer
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+                <LocationMarker position={tempMapLocation} setPosition={setTempMapLocation} />
+              </MapContainer>
+
+              {/* Floating info card */}
+              {tempMapLocation && (
+                <div className="absolute top-4 left-4 right-4 bg-white/95 backdrop-blur-sm rounded-2xl shadow-xl p-5 z-[1000]">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-bold text-gray-700 mb-1">Selected Location</p>
+                      <p className="text-lg font-bold text-purple-600">
+                        {tempMapLocation.lat.toFixed(6)}, {tempMapLocation.lng.toFixed(6)}
+                      </p>
+                    </div>
+                    <button
+                      onClick={handleMapLocationSelect}
+                      className="px-6 py-3 bg-gradient-to-r from-purple-500 to-pink-600 text-white rounded-xl hover:from-purple-600 hover:to-pink-700 transition-all shadow-md hover:shadow-lg font-semibold"
+                    >
+                      Confirm Location
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Instructions overlay */}
+              {!tempMapLocation && (
+                <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 bg-white/95 backdrop-blur-sm rounded-2xl shadow-xl px-6 py-4 z-[1000]">
+                  <p className="text-gray-700 font-medium flex items-center gap-2">
+                    <MapPin className="w-5 h-5 text-purple-500" />
+                    Click on the map to select pickup location
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Details Modal */}
+      {showDetailsModal && selectedPickup && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+              <h2 className="text-2xl font-bold text-gray-900">Pickup Details</h2>
+              <button
+                onClick={() => {
+                  setShowDetailsModal(false);
+                  setSelectedPickup(null);
+                }}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6">
+              {/* Status Badge */}
+              <div className="flex items-center justify-center">
+                <span className={`px-6 py-3 rounded-full text-sm font-semibold border-2 flex items-center gap-2 ${getStatusColor(selectedPickup.status)}`}>
+                  {getStatusIcon(selectedPickup.status)}
+                  {selectedPickup.status.toUpperCase()}
+                </span>
+              </div>
+
+              {/* Details Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Request ID</label>
+                    <p className="text-lg font-medium text-gray-900 mt-1">#{selectedPickup.id}</p>
+                  </div>
+                  <div>
+                    <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Address</label>
+                    <p className="text-lg font-medium text-gray-900 mt-1 flex items-start gap-2">
+                      <MapPin className="w-5 h-5 text-emerald-600 mt-0.5" />
+                      {selectedPickup.address}
+                    </p>
+                  </div>
+                  <div>
+                    <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Waste Type</label>
+                    <p className="mt-1">
+                      <span className={`px-4 py-2 rounded-lg text-sm font-medium ${getWasteTypeColor(selectedPickup.wasteType)}`}>
+                        {selectedPickup.wasteType}
+                      </span>
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Request Date</label>
+                    <p className="text-lg font-medium text-gray-900 mt-1">{selectedPickup.requestDate}</p>
+                  </div>
+                  <div>
+                    <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Preferred Date</label>
+                    <p className="text-lg font-medium text-gray-900 mt-1">{selectedPickup.preferredDate}</p>
+                  </div>
+                  <div>
+                    <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Time Slot</label>
+                    <p className="text-lg font-medium text-gray-900 mt-1 capitalize">{selectedPickup.preferredTime}</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Collector Info */}
+              {selectedPickup.collectorName && (
+                <div className="bg-emerald-50 rounded-xl p-5 border border-emerald-200">
+                  <h3 className="font-semibold text-emerald-900 mb-3 flex items-center gap-2">
+                    <Package className="w-5 h-5" />
+                    Collector Information
+                  </h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-sm text-emerald-700">Assigned Collector</label>
+                      <p className="font-medium text-emerald-900 mt-1">{selectedPickup.collectorName}</p>
+                    </div>
+                    {selectedPickup.scheduledDate && (
+                      <div>
+                        <label className="text-sm text-emerald-700">Scheduled Date</label>
+                        <p className="font-medium text-emerald-900 mt-1">{selectedPickup.scheduledDate}</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Weight */}
+              {selectedPickup.weight && (
+                <div className="bg-gray-50 rounded-xl p-5">
+                  <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Collected Weight</label>
+                  <p className="text-2xl font-bold text-gray-900 mt-2">{selectedPickup.weight} kg</p>
+                </div>
+              )}
+
+              {/* Notes */}
+              {selectedPickup.notes && (
+                <div>
+                  <label className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Notes</label>
+                  <div className="mt-2 p-4 bg-gray-50 rounded-xl">
+                    <p className="text-gray-700">{selectedPickup.notes}</p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="sticky bottom-0 bg-gray-50 px-6 py-4 flex gap-3 border-t border-gray-200">
+              <button
+                onClick={() => {
+                  setShowDetailsModal(false);
+                  setSelectedPickup(null);
+                }}
+                className="flex-1 px-6 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100 transition-colors font-medium"
+              >
+                Close
+              </button>
+              {(selectedPickup.status === 'pending' || selectedPickup.status === 'scheduled') && (
+                <button
+                  onClick={() => {
+                    handleCancelPickup(selectedPickup.id);
+                    setShowDetailsModal(false);
+                    setSelectedPickup(null);
+                  }}
+                  className="flex-1 px-6 py-2.5 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors font-medium"
+                >
+                  Cancel Pickup
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Assign Collector Modal */}
+      {showAssignModal && selectedPickup && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-lg w-full transform transition-all animate-fadeIn">
+            <div className="bg-gradient-to-r from-blue-500 to-indigo-600 px-8 py-6 rounded-t-3xl">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="p-3 bg-white/20 backdrop-blur-sm rounded-2xl">
+                    <UserCheck className="w-8 h-8 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">Assign Collector</h2>
+                    <p className="text-blue-100 mt-1">Assign a collector to this pickup request</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setShowAssignModal(false);
+                    setSelectedCollectorId('');
+                    setScheduledDate('');
+                  }}
+                  className="p-2 hover:bg-white/20 rounded-xl transition-colors"
+                >
+                  <X className="w-6 h-6 text-white" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-8 space-y-6">
+              {/* Pickup Info */}
+              <div className="bg-gray-50 rounded-xl p-4 space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="px-3 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700">
+                    {selectedPickup.wasteType}
+                  </span>
+                  <span className="text-sm text-gray-600">Requested on {selectedPickup.requestDate}</span>
+                </div>
+                <div className="flex items-center gap-2 text-gray-600">
+                  <MapPin className="w-4 h-4" />
+                  <span className="text-sm">{selectedPickup.address}</span>
+                </div>
+                <div className="flex items-center gap-2 text-gray-600">
+                  <Clock className="w-4 h-4" />
+                  <span className="text-sm">Preferred: {selectedPickup.preferredDate} - {selectedPickup.preferredTime}</span>
+                </div>
+              </div>
+
+              {/* Collector Selection */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Select Collector *
+                </label>
+                <select
+                  value={selectedCollectorId}
+                  onChange={(e) => setSelectedCollectorId(e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
+                  required
+                >
+                  <option value="">Choose a collector...</option>
+                  {collectors.map((collector: any) => (
+                    <option key={collector._id} value={collector._id}>
+                      {collector.firstName} {collector.lastName} - {collector.email}
+                    </option>
+                  ))}
+                </select>
+                {collectors.length === 0 && (
+                  <p className="mt-2 text-sm text-red-600">No collectors available. Please add collectors first.</p>
+                )}
+              </div>
+
+              {/* Scheduled Date */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Scheduled Date *
+                </label>
+                <input
+                  type="date"
+                  value={scheduledDate}
+                  onChange={(e) => setScheduledDate(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
+                  required
+                />
+                <p className="mt-2 text-sm text-gray-500">
+                  Preferred date: {selectedPickup.preferredDate}
+                </p>
+              </div>
+            </div>
+
+            <div className="sticky bottom-0 bg-gray-50 px-8 py-4 flex gap-3 border-t border-gray-200 rounded-b-3xl">
+              <button
+                onClick={() => {
+                  setShowAssignModal(false);
+                  setSelectedCollectorId('');
+                  setScheduledDate('');
+                }}
+                className="flex-1 px-6 py-2.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100 transition-colors font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAssignCollector}
+                disabled={!selectedCollectorId || !scheduledDate || assignCollectorMutation.isPending}
+                className="flex-1 px-6 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-lg hover:from-blue-600 hover:to-indigo-700 transition-all font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              >
+                {assignCollectorMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Assigning...
+                  </>
+                ) : (
+                  <>
+                    <UserCheck className="w-5 h-5" />
+                    Assign Collector
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bin Selector Modal */}
+      {showBinSelector && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-5xl w-full max-h-[90vh] overflow-hidden transform transition-all animate-fadeIn">
+            <div className="bg-gradient-to-r from-emerald-500 to-teal-600 px-8 py-6">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="p-3 bg-white/20 backdrop-blur-sm rounded-2xl">
+                    <Trash2 className="w-8 h-8 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">Select Bin Location</h2>
+                    <p className="text-emerald-50 text-sm mt-1">Choose which bin you want to request pickup for</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowBinSelector(false)}
+                  className="p-2 hover:bg-white/20 rounded-xl transition-colors"
+                >
+                  <X className="w-6 h-6 text-white" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 h-[600px] flex gap-6">
+              {/* Map */}
+              <div className="flex-1 rounded-2xl overflow-hidden shadow-lg">
+                <MapContainer
+                  center={userBinsData?.data?.[0]?.location?.coordinates 
+                    ? [userBinsData.data[0].location.coordinates[1], userBinsData.data[0].location.coordinates[0]]
+                    : [7.8731, 80.7718]} // Center of Sri Lanka
+                  zoom={8}
+                  style={{ height: '100%', width: '100%' }}
+                >
+                  <TileLayer
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                  />
+                  {userBinsData?.data?.map((bin: any) => {
+                    if (!bin.location?.coordinates) return null;
+                    const [lng, lat] = bin.location.coordinates;
+                    
+                    // Create custom icon based on bin type
+                    const binIcon = new L.Icon({
+                      iconUrl: bin.binType === 'recyclable' 
+                        ? 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png'
+                        : bin.binType === 'organic'
+                        ? 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-orange.png'
+                        : 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
+                      shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+                      iconSize: [25, 41],
+                      iconAnchor: [12, 41],
+                      popupAnchor: [1, -34],
+                      shadowSize: [41, 41]
+                    });
+
+                    return (
+                      <Marker 
+                        key={bin._id} 
+                        position={[lat, lng]}
+                        icon={binIcon}
+                        eventHandlers={{
+                          click: () => handleBinSelect(bin)
+                        }}
+                      >
+                        <Popup>
+                          <div className="p-2">
+                            <div className="font-bold text-lg mb-2">{bin.binId}</div>
+                            <div className="space-y-1 text-sm">
+                              <p><strong>Type:</strong> {bin.binType}</p>
+                              <p><strong>Status:</strong> {bin.status}</p>
+                              <p><strong>Fill Level:</strong> {bin.currentLevel}%</p>
+                              {bin.location.address && (
+                                <p><strong>Address:</strong> {bin.location.address}</p>
+                              )}
+                            </div>
+                            <button
+                              onClick={() => handleBinSelect(bin)}
+                              className="mt-3 w-full px-4 py-2 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors font-medium"
+                            >
+                              Select This Bin
+                            </button>
+                          </div>
+                        </Popup>
+                      </Marker>
+                    );
+                  })}
+                </MapContainer>
+              </div>
+
+              {/* Bins List */}
+              <div className="w-80 flex flex-col">
+                <h3 className="text-lg font-bold text-gray-900 mb-4">Your Bins</h3>
+                <div className="flex-1 overflow-y-auto space-y-3">
+                  {!userBinsData?.data || userBinsData.data.length === 0 ? (
+                    <div className="text-center py-12">
+                      <Trash2 className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                      <p className="text-gray-500 font-medium">No bins found</p>
+                      <p className="text-sm text-gray-400 mt-2">Request a bin to get started</p>
+                    </div>
+                  ) : (
+                    userBinsData.data.map((bin: any) => (
+                      <div
+                        key={bin._id}
+                        onClick={() => handleBinSelect(bin)}
+                        className="bg-white border-2 border-gray-200 rounded-xl p-4 hover:border-emerald-500 hover:shadow-md transition-all cursor-pointer group"
+                      >
+                        <div className="flex items-start justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <Trash2 className="w-5 h-5 text-emerald-500" />
+                            <span className="font-bold text-gray-900">{bin.binId}</span>
+                          </div>
+                          <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                            bin.status === 'active' 
+                              ? 'bg-green-100 text-green-700'
+                              : 'bg-gray-100 text-gray-700'
+                          }`}>
+                            {bin.status}
+                          </span>
+                        </div>
+                        <div className="space-y-1 text-sm text-gray-600">
+                          <p><strong>Type:</strong> {bin.binType}</p>
+                          <p><strong>Fill Level:</strong> {bin.currentLevel}%</p>
+                          {bin.location.address && (
+                            <p className="text-xs text-gray-500 mt-2 line-clamp-2">
+                              📍 {bin.location.address}
+                            </p>
+                          )}
+                        </div>
+                        <div className="mt-3 text-emerald-600 font-medium text-sm group-hover:text-emerald-700 flex items-center gap-1">
+                          <MapPin className="w-4 h-4" />
+                          Click to select
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="sticky bottom-0 bg-gray-50 px-8 py-4 border-t border-gray-200">
+              <button
+                onClick={() => setShowBinSelector(false)}
+                className="w-full px-6 py-3 bg-gray-200 text-gray-700 rounded-xl hover:bg-gray-300 transition-colors font-medium"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </Layout>
+  );
+};
